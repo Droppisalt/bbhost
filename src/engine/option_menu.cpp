@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 
 // ---------------------------------------------------------------------------
@@ -1549,6 +1550,69 @@ GUEST_ABI void* quit_opener(void* out, void* factory) {
     return out;
 }
 
+// ---- Save and Quit, in game ------------------------------------------------------
+//
+// System > Exit Game in a running game is the game's own way out of a session:
+// it asks, saves, and returns to the title. "Save and Quit" is that, then the
+// window closes. It does not repeat the save: its row runs the game's own
+// Exit Game opener (sub_200c9f0), so the question and the YES action are the
+// game's, and what changes is what happens once the title is back - the title
+// list's finalize (title_finalize_hook) sees the request and closes the window.
+//
+// The request is armed when the row opens, before YES or NO is answered, and
+// the game's YES action is not ours to see. So it is disarmed whenever the
+// player could have gone another way: every System list build, and the plain
+// Exit Game row (which runs through exit_game_opener below). After NO, only
+// this row can arm it again.
+constexpr std::uint32_t kSaveQuitRowId = 122001;
+std::atomic<bool> g_quit_after_title{false};
+
+GUEST_ABI void* exit_game_opener(void* out, void* factory) {
+    g_quit_after_title.store(false);
+    hle_call_guest<std::int64_t>(guest_fn(kExitGameOpener), out, factory);
+    return out;
+}
+
+GUEST_ABI void* save_quit_opener(void* out, void* factory) {
+    g_quit_after_title.store(true);
+    hle_call_guest<std::int64_t>(guest_fn(kExitGameOpener), out, factory);
+    return out;
+}
+
+// The quit itself. The game saves as it leaves for the title - a writable save
+// unmounted, or its save memory written - and that is the signal, not the
+// title's command list: that is built only after Online/Offline is chosen, and
+// the player could sit on that question forever. The quit waits until no save
+// has been committed for a moment, so a save written in several steps is
+// finished first. The title's list is the fallback if no save was seen.
+std::atomic<std::uint32_t> g_save_generation{0};
+
+void quit_when_quiet(const char* why, std::chrono::milliseconds quiet) {
+    const std::uint32_t gen = g_save_generation.fetch_add(1) + 1;
+    host_log("pc-options: Save and Quit, %s, closing in %lld ms unless it saves again", why,
+             static_cast<long long>(quiet.count()));
+    std::thread([gen, quiet] {
+        std::this_thread::sleep_for(quiet);
+        if (g_save_generation.load() != gen) return;  // a later save restarted the wait
+        if (!g_quit_after_title.exchange(false)) return;
+        host_log("pc-options: Save and Quit, closing");
+        host_window_request_quit();
+    }).detach();
+}
+
+void quit_after_title_if_armed() {
+    if (g_quit_after_title.load()) quit_when_quiet("the title is up", std::chrono::milliseconds(2000));
+}
+
+}  // namespace
+
+// From the save-data calls (hle/system.cpp), on whatever thread made them.
+void option_menu_save_committed() {
+    if (g_quit_after_title.load()) quit_when_quiet("a save was committed", std::chrono::milliseconds(2500));
+}
+
+namespace {
+
 GUEST_ABI std::int64_t title_finalize_hook(std::uint64_t, const std::uint64_t* saved) {
     void* builder = reinterpret_cast<void*>(static_cast<std::uintptr_t>(saved[4]));  // rsi
     {
@@ -1559,6 +1623,7 @@ GUEST_ABI std::int64_t title_finalize_hook(std::uint64_t, const std::uint64_t* s
     }
     hle_call_guest6(guest_fn(kTitleFinalize), static_cast<std::int64_t>(saved[5]), static_cast<std::int64_t>(saved[4]),
                     static_cast<std::int64_t>(saved[3]), 0, 0, 0);
+    quit_after_title_if_armed();
     return 1;  // the call was made here
 }
 
@@ -1884,6 +1949,7 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
          hle_wrap_fn(reinterpret_cast<void*>(&pc_keys_row_open))},
     };
     std::int64_t flag = 0;
+    g_quit_after_title.store(false);  // a System list is a fresh start
     // Exit Game, if it is there, is last at this point - sub_1fb3ad0 adds it
     // fifth and then adds and pops Language above it. Appending after it would
     // bury it in the middle of the in-game list, so it comes off first and
@@ -1915,8 +1981,14 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
         // Three arguments and no flag: Exit Game is not a section opener, it
         // is a command, and sub_1f4c9a0 is what builds one.
         Captions c(kExitGameRowId);
-        GuestFunction f(kRowFunctorVTable, guest_fn(kExitGameOpener));
+        static void* opener = hle_wrap_fn(reinterpret_cast<void*>(&exit_game_opener));
+        GuestFunction f(kRowFunctorVTable, opener);
         hle_call_guest<std::int64_t>(guest_fn(kAddExitRow), builder, c.buf, f.buf);
+        // Only in game: the title's list has no Exit Game, and its own Quit Game.
+        Captions q(kSaveQuitRowId);
+        static void* quit_opener_fn = hle_wrap_fn(reinterpret_cast<void*>(&save_quit_opener));
+        GuestFunction qf(kRowFunctorVTable, quit_opener_fn);
+        hle_call_guest<std::int64_t>(guest_fn(kAddExitRow), builder, q.buf, qf.buf);
     }
     hle_call_guest<std::int64_t>(guest_fn(kSystemFinalize), out, builder, arg3);
     static int logged = 0;

@@ -14,6 +14,7 @@
 #include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
+#include "engine/option_menu.h"
 #include "engine/mouse_camera.h"
 #include "host/bindings.h"
 #include "host/ingame_menu.h"
@@ -844,7 +845,10 @@ GUEST_ABI int hle_save_umount(const char* mount_point) {
             host_log("save %s: the commit stopped at %s; the next mount finishes it", g_save_mounts[slot].dir_name.c_str(), why.c_str());
         g_save_mounts[slot].staged = false;
     }
-    if (g_save_mounts[slot].writable) back_up_save(g_save_mounts[slot].dir_name);
+    if (g_save_mounts[slot].writable) {
+        back_up_save(g_save_mounts[slot].dir_name);
+        option_menu_save_committed();
+    }
     return 0;
 }
 
@@ -1149,6 +1153,7 @@ GUEST_ABI int hle_save_set_memory(int user_id, const void* buf, std::uint64_t si
     std::fseek(f, static_cast<long>(off), SEEK_SET);
     std::fwrite(buf, 1, static_cast<std::size_t>(size), f);
     std::fclose(f);
+    option_menu_save_committed();
     return 0;
 }
 

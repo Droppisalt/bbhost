@@ -50,3 +50,7 @@ void option_menu_confirm_ask(std::uint32_t message);
 int option_menu_confirm_take();
 // Answers an open question NO, as the player would (no close of its own).
 void option_menu_confirm_close();
+
+// A save was committed (a writable save unmounted, save memory written). Lets
+// Save and Quit close the window once the game has saved on its way out.
+void option_menu_save_committed();
